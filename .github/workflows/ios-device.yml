@@ -1,5 +1,6 @@
 name: iOS Device IPA
 
+# Device IPA workflow for the iPhone SDL port scaffold.
 on:
   workflow_dispatch:
   push:
