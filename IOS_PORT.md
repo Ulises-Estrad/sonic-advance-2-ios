@@ -30,6 +30,15 @@ Payload/
 
 The app is ad-hoc signed so Sideloadly can re-sign/install it on a physical iPhone.
 
+## Current Baseline
+
+- first passing iOS artifact run: `27059448898`
+- artifact: `sonic-advance-2-ios-device-arm64`
+- IPA: `build-products/SonicAdvance2-ios-device-adhoc.ipa`
+- producing commit: `cf439d68`
+
+The inherited upstream `CI` workflow is manual-only in this fork because it expects upstream ROM/assets/gh-pages infrastructure that is not required for the iPhone IPA path.
+
 ## Controls
 
 The first iOS build includes a simple fixed touch overlay:
