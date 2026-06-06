@@ -101,6 +101,7 @@ jobs:
               -DCMAKE_SYSTEM_NAME=iOS \
               -DCMAKE_OSX_SYSROOT=iphoneos \
               -DCMAKE_OSX_ARCHITECTURES="$IOS_DEVICE_ARCH" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_MIN_VERSION" \
               -DCMAKE_INSTALL_PREFIX="$SDL2_PREFIX" \
               -DSDL_STATIC=ON \
               -DSDL_SHARED=OFF \
