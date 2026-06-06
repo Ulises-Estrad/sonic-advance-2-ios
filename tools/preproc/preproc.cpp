@@ -145,6 +145,7 @@ int main(int argc, char **argv)
     bool fullRGBA = false;
     if((!platform.compare("gba"))
     || (!platform.compare("sdl"))
+    || (!platform.compare("sdl_ios"))
     || (!platform.compare("sdl_win32"))
     || (!platform.compare("sdl_psp"))
     || (!platform.compare("ps2")))
