@@ -1,9 +1,14 @@
 #include <assert.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include <errno.h>
+#include <signal.h>
+#include <sys/stat.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -27,6 +32,10 @@
 
 #if ENABLE_AUDIO
 #include "platform/shared/audio/cgb_audio.h"
+#endif
+
+#ifndef SA2_IOS
+#define SA2_IOS 0
 #endif
 
 ALIGNED(256) uint16_t gameImage[DISPLAY_WIDTH * DISPLAY_HEIGHT];
@@ -80,9 +89,392 @@ static void CloseSaveFile(void);
 
 u16 Platform_GetKeyInput(void);
 
+#if SA2_IOS
+static void IosInitDiagnosticsAndSavePath(void);
+static void IosLog(const char *fmt, ...);
+static void IosInstallSignalHandlers(void);
+static void IosHandleTouchEvent(const SDL_Event *event);
+static void IosDrawTouchOverlay(void);
+static u16 IosGetTouchKeys(void);
+static void IosHeartbeat(void);
+#endif
+
 #ifdef _WIN32
 void *Platform_malloc(size_t numBytes) { return HeapAlloc(GetProcessHeap(), HEAP_GENERATE_EXCEPTIONS | HEAP_ZERO_MEMORY, numBytes); }
 void Platform_free(void *ptr) { HeapFree(GetProcessHeap(), 0, ptr); }
+#endif
+
+#if SA2_IOS
+#define IOS_MAX_TOUCHES 12
+#define IOS_LOG_PATH_MAX 1024
+
+typedef struct {
+    SDL_FingerID fingerId;
+    float x;
+    float y;
+    bool active;
+} IosTouch;
+
+typedef struct {
+    const char *label;
+    float x;
+    float y;
+    float radius;
+    u16 key;
+} IosButton;
+
+static IosTouch sIosTouches[IOS_MAX_TOUCHES];
+static FILE *sIosLogFile = NULL;
+static char sIosSavePath[IOS_LOG_PATH_MAX] = "sa2.sav";
+static char sIosDiagnosticsDir[IOS_LOG_PATH_MAX] = "";
+static Uint32 sIosLaunchTicks = 0;
+static Uint32 sIosLastHeartbeatTicks = 0;
+static u32 sIosFrameCounter = 0;
+static u32 sIosHeartbeatCounter = 0;
+static u16 sIosTouchKeys = 0;
+static float sIosJoyKnobX = 74.0f;
+static float sIosJoyKnobY = 172.0f;
+
+static const IosButton sIosButtons[] = {
+    { "A", 356.0f, 170.0f, 20.0f, A_BUTTON },
+    { "B", 392.0f, 132.0f, 20.0f, B_BUTTON },
+    { "L", 322.0f, 132.0f, 18.0f, L_BUTTON },
+    { "R", 356.0f, 94.0f, 18.0f, R_BUTTON },
+    { "ST", 386.0f, 32.0f, 15.0f, START_BUTTON },
+    { "SE", 346.0f, 32.0f, 15.0f, SELECT_BUTTON },
+};
+
+static void IosEnsureDir(const char *path)
+{
+    if (path == NULL || path[0] == '\0') {
+        return;
+    }
+    if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+        SDL_Log("SA2 iOS: mkdir failed for %s: %s", path, strerror(errno));
+    }
+}
+
+static void IosJoinPath(char *out, size_t outSize, const char *left, const char *right)
+{
+    if (left == NULL || left[0] == '\0') {
+        snprintf(out, outSize, "%s", right);
+        return;
+    }
+
+    size_t len = strlen(left);
+    const char *slash = (len > 0 && left[len - 1] == '/') ? "" : "/";
+    snprintf(out, outSize, "%s%s%s", left, slash, right);
+}
+
+static void IosWriteLatestCrashReport(int signalNumber)
+{
+    char reportPath[IOS_LOG_PATH_MAX];
+    IosJoinPath(reportPath, sizeof(reportPath), sIosDiagnosticsDir, "LATEST_CRASH_OR_ABRUPT_EXIT_REPORT.txt");
+
+    FILE *report = fopen(reportPath, "w");
+    if (report == NULL) {
+        return;
+    }
+
+    Uint32 ticks = SDL_GetTicks();
+    fprintf(report, "build=sonic-advance-2-ios-initial\n");
+    fprintf(report, "signal=%d\n", signalNumber);
+    fprintf(report, "ticks=%u\n", ticks);
+    fprintf(report, "runtime_ms=%u\n", ticks - sIosLaunchTicks);
+    fprintf(report, "frame_counter=%u\n", sIosFrameCounter);
+    fprintf(report, "heartbeat_counter=%u\n", sIosHeartbeatCounter);
+    fprintf(report, "touch_keys=0x%04x\n", sIosTouchKeys);
+    fprintf(report, "save_path=%s\n", sIosSavePath);
+    fprintf(report, "diagnostics_dir=%s\n", sIosDiagnosticsDir);
+    fprintf(report, "note=reopen the app once after a crash, then copy this file from Files > On My iPhone > SonicAdvance2 > SA2_DIAGNOSTICS\n");
+    fclose(report);
+}
+
+static void IosSignalHandler(int signalNumber)
+{
+    IosWriteLatestCrashReport(signalNumber);
+    if (sIosLogFile != NULL) {
+        fprintf(sIosLogFile, "signal=%d ticks=%u frame_counter=%u heartbeat_counter=%u touch_keys=0x%04x\n", signalNumber,
+                SDL_GetTicks(), sIosFrameCounter, sIosHeartbeatCounter, sIosTouchKeys);
+        fflush(sIosLogFile);
+    }
+    signal(signalNumber, SIG_DFL);
+    raise(signalNumber);
+}
+
+static void IosInstallSignalHandlers(void)
+{
+    signal(SIGABRT, IosSignalHandler);
+    signal(SIGBUS, IosSignalHandler);
+    signal(SIGFPE, IosSignalHandler);
+    signal(SIGILL, IosSignalHandler);
+    signal(SIGSEGV, IosSignalHandler);
+}
+
+static void IosLog(const char *fmt, ...)
+{
+    char line[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+
+    SDL_Log("SA2 iOS: %s", line);
+    if (sIosLogFile != NULL) {
+        fprintf(sIosLogFile, "%s\n", line);
+        fflush(sIosLogFile);
+    }
+}
+
+static void IosInitDiagnosticsAndSavePath(void)
+{
+    sIosLaunchTicks = SDL_GetTicks();
+    sIosLastHeartbeatTicks = sIosLaunchTicks;
+
+    const char *home = getenv("HOME");
+    if (home != NULL && home[0] != '\0') {
+        char documentsPath[IOS_LOG_PATH_MAX];
+        IosJoinPath(documentsPath, sizeof(documentsPath), home, "Documents");
+        IosEnsureDir(documentsPath);
+        IosJoinPath(sIosDiagnosticsDir, sizeof(sIosDiagnosticsDir), documentsPath, "SA2_DIAGNOSTICS");
+        IosEnsureDir(sIosDiagnosticsDir);
+    } else {
+        snprintf(sIosDiagnosticsDir, sizeof(sIosDiagnosticsDir), ".");
+    }
+
+    char currentPath[IOS_LOG_PATH_MAX];
+    char previousPath[IOS_LOG_PATH_MAX];
+    IosJoinPath(currentPath, sizeof(currentPath), sIosDiagnosticsDir, "CURRENT_SESSION_RUNTIME_LOG.txt");
+    IosJoinPath(previousPath, sizeof(previousPath), sIosDiagnosticsDir, "PREVIOUS_SESSION_RUNTIME_LOG.txt");
+    remove(previousPath);
+    rename(currentPath, previousPath);
+    sIosLogFile = fopen(currentPath, "w");
+
+    char *prefPath = SDL_GetPrefPath("UlisesEstrad", "SonicAdvance2IOS");
+    if (prefPath != NULL) {
+        IosJoinPath(sIosSavePath, sizeof(sIosSavePath), prefPath, "sa2.sav");
+        SDL_free(prefPath);
+    } else {
+        snprintf(sIosSavePath, sizeof(sIosSavePath), "sa2.sav");
+    }
+
+    IosLog("===== SA2 IOS RUN ticks=%u =====", sIosLaunchTicks);
+    IosLog("build=sonic-advance-2-ios-initial");
+    IosLog("save_path=%s", sIosSavePath);
+    IosLog("diagnostics_dir=%s", sIosDiagnosticsDir);
+}
+
+static IosTouch *IosFindTouch(SDL_FingerID fingerId)
+{
+    for (int i = 0; i < IOS_MAX_TOUCHES; i++) {
+        if (sIosTouches[i].active && sIosTouches[i].fingerId == fingerId) {
+            return &sIosTouches[i];
+        }
+    }
+    return NULL;
+}
+
+static IosTouch *IosAllocTouch(SDL_FingerID fingerId)
+{
+    IosTouch *touch = IosFindTouch(fingerId);
+    if (touch != NULL) {
+        return touch;
+    }
+
+    for (int i = 0; i < IOS_MAX_TOUCHES; i++) {
+        if (!sIosTouches[i].active) {
+            sIosTouches[i].active = true;
+            sIosTouches[i].fingerId = fingerId;
+            return &sIosTouches[i];
+        }
+    }
+    return NULL;
+}
+
+static bool IosPointInButton(float x, float y, const IosButton *button)
+{
+    float dx = x - button->x;
+    float dy = y - button->y;
+    return (dx * dx + dy * dy) <= (button->radius * button->radius);
+}
+
+static void IosRecomputeTouchKeys(void)
+{
+    u16 oldKeys = sIosTouchKeys;
+    u16 newKeys = 0;
+    bool joystickActive = false;
+    const float joyCenterX = 74.0f;
+    const float joyCenterY = 172.0f;
+    const float joyRadius = 48.0f;
+    const float joyDeadzone = 12.0f;
+    sIosJoyKnobX = joyCenterX;
+    sIosJoyKnobY = joyCenterY;
+
+    for (int i = 0; i < IOS_MAX_TOUCHES; i++) {
+        if (!sIosTouches[i].active) {
+            continue;
+        }
+
+        float x = sIosTouches[i].x;
+        float y = sIosTouches[i].y;
+        float dx = x - joyCenterX;
+        float dy = y - joyCenterY;
+        float dist2 = dx * dx + dy * dy;
+
+        if (dist2 <= joyRadius * joyRadius) {
+            joystickActive = true;
+            if (dx > joyDeadzone) {
+                newKeys |= DPAD_RIGHT;
+            } else if (dx < -joyDeadzone) {
+                newKeys |= DPAD_LEFT;
+            }
+            if (dy > joyDeadzone) {
+                newKeys |= DPAD_DOWN;
+            } else if (dy < -joyDeadzone) {
+                newKeys |= DPAD_UP;
+            }
+            sIosJoyKnobX = x;
+            sIosJoyKnobY = y;
+        }
+
+        for (unsigned int b = 0; b < ARRAY_COUNT(sIosButtons); b++) {
+            if (IosPointInButton(x, y, &sIosButtons[b])) {
+                newKeys |= sIosButtons[b].key;
+            }
+        }
+    }
+
+    if (!joystickActive) {
+        sIosJoyKnobX = joyCenterX;
+        sIosJoyKnobY = joyCenterY;
+    }
+
+    sIosTouchKeys = newKeys;
+    if (oldKeys != newKeys) {
+        IosLog("touch_keys old=0x%04x new=0x%04x", oldKeys, newKeys);
+    }
+}
+
+static void IosHandleTouchEvent(const SDL_Event *event)
+{
+    if (event->type == SDL_FINGERDOWN || event->type == SDL_FINGERMOTION) {
+        IosTouch *touch = IosAllocTouch(event->tfinger.fingerId);
+        if (touch != NULL) {
+            touch->x = event->tfinger.x * DISPLAY_WIDTH;
+            touch->y = event->tfinger.y * DISPLAY_HEIGHT;
+            IosLog("touch_%s id=%lld x=%.1f y=%.1f", event->type == SDL_FINGERDOWN ? "down" : "motion",
+                   (long long)event->tfinger.fingerId, touch->x, touch->y);
+        }
+    } else if (event->type == SDL_FINGERUP) {
+        IosTouch *touch = IosFindTouch(event->tfinger.fingerId);
+        if (touch != NULL) {
+            IosLog("touch_up id=%lld x=%.1f y=%.1f", (long long)event->tfinger.fingerId, touch->x, touch->y);
+            touch->active = false;
+        }
+    }
+
+    IosRecomputeTouchKeys();
+}
+
+static u16 IosGetTouchKeys(void) { return sIosTouchKeys; }
+
+static const uint8_t *IosGlyphRows(char ch)
+{
+    static const uint8_t A[] = { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 };
+    static const uint8_t B[] = { 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E };
+    static const uint8_t L[] = { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F };
+    static const uint8_t R[] = { 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 };
+    static const uint8_t S[] = { 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E };
+    static const uint8_t T[] = { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 };
+    static const uint8_t E[] = { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F };
+
+    switch (ch) {
+        case 'A': return A;
+        case 'B': return B;
+        case 'L': return L;
+        case 'R': return R;
+        case 'S': return S;
+        case 'T': return T;
+        case 'E': return E;
+        default: return NULL;
+    }
+}
+
+static void IosDrawText(SDL_Renderer *renderer, const char *text, int x, int y, int scale)
+{
+    SDL_Rect rect;
+    rect.w = scale;
+    rect.h = scale;
+
+    for (int c = 0; text[c] != '\0'; c++) {
+        const uint8_t *rows = IosGlyphRows(text[c]);
+        if (rows != NULL) {
+            for (int row = 0; row < 7; row++) {
+                for (int col = 0; col < 5; col++) {
+                    if (rows[row] & (1 << (4 - col))) {
+                        rect.x = x + c * 6 * scale + col * scale;
+                        rect.y = y + row * scale;
+                        SDL_RenderFillRect(renderer, &rect);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void IosDrawCircle(SDL_Renderer *renderer, int cx, int cy, int radius, bool filled)
+{
+    int r2 = radius * radius;
+    for (int y = -radius; y <= radius; y++) {
+        for (int x = -radius; x <= radius; x++) {
+            int d2 = x * x + y * y;
+            if ((filled && d2 <= r2) || (!filled && d2 <= r2 && d2 >= (radius - 2) * (radius - 2))) {
+                SDL_RenderDrawPoint(renderer, cx + x, cy + y);
+            }
+        }
+    }
+}
+
+static void IosDrawTouchOverlay(void)
+{
+    SDL_BlendMode oldBlendMode;
+    SDL_GetRenderDrawBlendMode(sdlRenderer, &oldBlendMode);
+    SDL_SetRenderDrawBlendMode(sdlRenderer, SDL_BLENDMODE_BLEND);
+
+    SDL_SetRenderDrawColor(sdlRenderer, 0, 0, 0, 110);
+    IosDrawCircle(sdlRenderer, 74, 172, 48, true);
+    SDL_SetRenderDrawColor(sdlRenderer, 255, 255, 255, 180);
+    IosDrawCircle(sdlRenderer, 74, 172, 48, false);
+    SDL_SetRenderDrawColor(sdlRenderer, 255, 255, 255, 120);
+    SDL_RenderDrawLine(sdlRenderer, 34, 172, 114, 172);
+    SDL_RenderDrawLine(sdlRenderer, 74, 132, 74, 212);
+    SDL_SetRenderDrawColor(sdlRenderer, 80, 180, 255, 190);
+    IosDrawCircle(sdlRenderer, (int)sIosJoyKnobX, (int)sIosJoyKnobY, 16, true);
+
+    for (unsigned int i = 0; i < ARRAY_COUNT(sIosButtons); i++) {
+        const IosButton *button = &sIosButtons[i];
+        SDL_SetRenderDrawColor(sdlRenderer, 0, 0, 0, 130);
+        IosDrawCircle(sdlRenderer, (int)button->x, (int)button->y, (int)button->radius, true);
+        SDL_SetRenderDrawColor(sdlRenderer, 255, 255, 255, 200);
+        IosDrawCircle(sdlRenderer, (int)button->x, (int)button->y, (int)button->radius, false);
+        int labelWidth = (int)strlen(button->label) * 12 - 2;
+        IosDrawText(sdlRenderer, button->label, (int)(button->x - labelWidth / 2), (int)(button->y - 7), 2);
+    }
+
+    SDL_SetRenderDrawBlendMode(sdlRenderer, oldBlendMode);
+}
+
+static void IosHeartbeat(void)
+{
+    sIosFrameCounter++;
+    Uint32 ticks = SDL_GetTicks();
+    if (ticks - sIosLastHeartbeatTicks >= 5000) {
+        sIosHeartbeatCounter++;
+        IosLog("heartbeat=%u ticks=%u runtime_ms=%u frames=%u touch_keys=0x%04x audio_queue=%u", sIosHeartbeatCounter, ticks,
+               ticks - sIosLaunchTicks, sIosFrameCounter, sIosTouchKeys, SDL_GetQueuedAudioSize(1));
+        sIosLastHeartbeatTicks = ticks;
+    }
+}
 #endif
 
 #ifdef __PSP__
@@ -151,7 +543,9 @@ int main(int argc, char **argv)
     freopen("CON", "w", stdout);
 #endif
 
+#if !SA2_IOS
     ReadSaveFile("sa2.sav");
+#endif
 
     // Prevent the multiplayer screen from being drawn ( see core.c:EngineInit() )
     REG_RCNT = 0x8000;
@@ -170,6 +564,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "SDL could not initialize! SDL_Error: %s\n", SDL_GetError());
         return 1;
     }
+#if SA2_IOS
+    IosInitDiagnosticsAndSavePath();
+    IosInstallSignalHandlers();
+    IosLog("SDL_Init ok");
+    ReadSaveFile(sIosSavePath);
+#endif
 
 #ifdef __PSP__
     if (SDL_NumJoysticks() > 0) {
@@ -193,6 +593,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "Window could not be created! SDL_Error: %s\n", SDL_GetError());
         return 1;
     }
+#if SA2_IOS
+    IosLog("SDL_CreateWindow success display=%dx%d", DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#endif
 
 #if ENABLE_VRAM_VIEW
     int mainWindowX;
@@ -223,6 +626,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "Renderer could not be created! SDL_Error: %s\n", SDL_GetError());
         return 1;
     }
+#if SA2_IOS
+    IosLog("SDL_CreateRenderer success");
+#endif
 
 #if ENABLE_VRAM_VIEW
     vramRenderer = SDL_CreateRenderer(vramWindow, -1, SDL_RENDERER_PRESENTVSYNC);
@@ -252,6 +658,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "Texture could not be created! SDL_Error: %s\n", SDL_GetError());
         return 1;
     }
+#if SA2_IOS
+    IosLog("SDL_CreateTexture success");
+#endif
 
 #if ENABLE_VRAM_VIEW
     vramTexture = SDL_CreateTexture(vramRenderer, SDL_PIXELFORMAT_ABGR1555, SDL_TEXTUREACCESS_STREAMING, vramWindowWidth, vramWindowHeight);
@@ -278,11 +687,17 @@ int main(int argc, char **argv)
             SDL_Log("We didn't get S16 audio format.");
         SDL_PauseAudio(0);
     }
+#if SA2_IOS
+    IosLog("audio init requested freq=%d channels=%d samples=%d queued=%u", want.freq, want.channels, want.samples, SDL_GetQueuedAudioSize(1));
+#endif
 #endif
 
     VDraw(sdlTexture);
 #if ENABLE_VRAM_VIEW
     VramDraw(vramTexture);
+#endif
+#if SA2_IOS
+    IosLog("runtime handoff start");
 #endif
     AgbMain();
 
@@ -370,6 +785,10 @@ void VBlankIntrWait(void)
 #else
         SDL_RenderClear(sdlRenderer);
         SDL_RenderCopy(sdlRenderer, sdlTexture, NULL, NULL);
+#if SA2_IOS
+        IosDrawTouchOverlay();
+        IosHeartbeat();
+#endif
 
 #if ENABLE_VRAM_VIEW
         VramDraw(vramTexture);
@@ -388,7 +807,17 @@ void VBlankIntrWait(void)
 #endif
     }
 
+#if SA2_IOS
+    IosLog("clean shutdown frames=%u heartbeats=%u", sIosFrameCounter, sIosHeartbeatCounter);
+#endif
     CloseSaveFile();
+
+#if SA2_IOS
+    if (sIosLogFile != NULL) {
+        fclose(sIosLogFile);
+        sIosLogFile = NULL;
+    }
+#endif
 
     SDL_DestroyWindow(sdlWindow);
     SDL_Quit();
@@ -543,8 +972,33 @@ void ProcessSDLEvents(void)
 
         switch (event.type) {
             case SDL_QUIT:
+#if SA2_IOS
+                IosLog("event=SDL_QUIT");
+#endif
                 isRunning = false;
                 break;
+#if SA2_IOS
+            case SDL_APP_WILLENTERBACKGROUND:
+                IosLog("event=SDL_APP_WILLENTERBACKGROUND");
+                break;
+            case SDL_APP_DIDENTERBACKGROUND:
+                IosLog("event=SDL_APP_DIDENTERBACKGROUND");
+                break;
+            case SDL_APP_WILLENTERFOREGROUND:
+                IosLog("event=SDL_APP_WILLENTERFOREGROUND");
+                break;
+            case SDL_APP_DIDENTERFOREGROUND:
+                IosLog("event=SDL_APP_DIDENTERFOREGROUND");
+                break;
+            case SDL_APP_TERMINATING:
+                IosLog("event=SDL_APP_TERMINATING");
+                break;
+            case SDL_FINGERDOWN:
+            case SDL_FINGERMOTION:
+            case SDL_FINGERUP:
+                IosHandleTouchEvent(&event);
+                break;
+#endif
             case SDL_KEYUP:
                 switch (event.key.keysym.sym) {
                     HANDLE_KEYUP(A_BUTTON)
@@ -656,6 +1110,10 @@ u16 Platform_GetKeyInput(void)
 
 #ifdef __PSP__
     return keys | PollJoystickButtons();
+#endif
+
+#if SA2_IOS
+    return keys | IosGetTouchKeys();
 #endif
 
     return keys;

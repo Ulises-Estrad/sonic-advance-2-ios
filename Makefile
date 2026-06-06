@@ -63,7 +63,9 @@ else ifeq ($(PLATFORM),ps2)
 else
 # Native
   ifneq ($(PLATFORM),sdl)
+  ifneq ($(PLATFORM),sdl_ios)
     $(error Unsupported CPU arch for platform '$(CPU_ARCH)', '$(PLATFORM)')
+  endif
   endif
 endif # (PLATFORM == gba)
 
@@ -92,6 +94,17 @@ OBJCOPY   := $(PREFIX)objcopy
 AS 		  := $(PREFIX)as
 
 FORMAT    := clang-format-13
+
+ifeq ($(PLATFORM),sdl_ios)
+IOS_SDK         ?= iphoneos
+IOS_ARCH        ?= arm64
+IOS_MIN_VERSION ?= 13.0
+IOS_SYSROOT     ?= $(shell xcrun --sdk $(IOS_SDK) --show-sdk-path)
+CC1             := xcrun --sdk $(IOS_SDK) clang -arch $(IOS_ARCH) -isysroot $(IOS_SYSROOT) -miphoneos-version-min=$(IOS_MIN_VERSION)
+CXX             := xcrun --sdk $(IOS_SDK) clang++ -arch $(IOS_ARCH) -isysroot $(IOS_SYSROOT) -miphoneos-version-min=$(IOS_MIN_VERSION)
+CPP             := $(CC1) -E
+AS              := $(CC1) -x assembler -c
+endif
 
 ### TOOLS ###
 GFX 	  := tools/gbagfx/gbagfx$(EXE)
@@ -127,6 +140,10 @@ ELF      := $(ROM:.gba=.elf)
 MAP      := $(ROM:.gba=.map)
 else ifeq ($(PLATFORM),sdl)
 ROM      := $(BUILD_NAME).sdl
+ELF      := $(ROM).elf
+MAP      := $(ROM).map
+else ifeq ($(PLATFORM),sdl_ios)
+ROM      := $(BUILD_NAME).sdl_ios
 ELF      := $(ROM).elf
 MAP      := $(ROM).map
 else ifeq ($(PLATFORM),sdl_psp)
@@ -180,6 +197,8 @@ endif
 ifeq ($(PLATFORM),gba)
 C_SRCS_IN := $(shell find $(C_SUBDIR) -name "*.c" $(C_SRC_IGNORE_PATHS) -not -path "*/platform/*")
 else ifeq ($(PLATFORM),sdl)
+C_SRCS_IN := $(shell find $(C_SUBDIR) -name "*.c" $(C_SRC_IGNORE_PATHS) -not -path "*/platform/win32/*" -not -path "*/platform/ps2/*")
+else ifeq ($(PLATFORM),sdl_ios)
 C_SRCS_IN := $(shell find $(C_SUBDIR) -name "*.c" $(C_SRC_IGNORE_PATHS) -not -path "*/platform/win32/*" -not -path "*/platform/ps2/*")
 else ifeq ($(PLATFORM),sdl_psp)
 C_SRCS_IN := $(shell find $(C_SUBDIR) -name "*.c" $(C_SRC_IGNORE_PATHS) -not -path "*/platform/win32/*" -not -path "*/platform/ps2/*")
@@ -263,6 +282,9 @@ else
 	ifeq ($(PLATFORM),sdl)
 		CC1FLAGS += -Wno-parentheses-equality -Wno-unused-value
 		CPPFLAGS += -D TITLE_BAR=$(BUILD_NAME).$(PLATFORM) -D PLATFORM_GBA=0 -D PLATFORM_SDL=1 -D PLATFORM_WIN32=0 $(shell sdl2-config --cflags)
+	else ifeq ($(PLATFORM),sdl_ios)
+		CC1FLAGS += -Wno-parentheses-equality -Wno-unused-value
+		CPPFLAGS += -D TITLE_BAR=SonicAdvance2iOS -D PLATFORM_GBA=0 -D PLATFORM_SDL=1 -D PLATFORM_WIN32=0 -D SA2_IOS=1 -I$(SDL2_IOS_ROOT)/include/SDL2
 	else ifeq ($(PLATFORM),sdl_psp)
 		CC1FLAGS += -G0
 		CPPFLAGS += -D PLATFORM_GBA=0 -D PLATFORM_SDL=1 -D PLATFORM_WIN32=0 -D SDL_MAIN_HANDLED -I$(PSPDEV)/psp/include/SDL2 -I$(PSPDEV)/psp/include -I$(PSPSDK)/include -D_PSP_FW_VERSION=600
@@ -333,6 +355,8 @@ else
     # for modern we are using a modern compiler
     # so instead of CPP we can use gcc -E to "preprocess only"
     CPP := $(CC1) -E
+  else ifeq ($(PLATFORM), sdl_ios)
+    CPP := $(CC1) -E
   else ifeq ($(PLATFORM), sdl_psp)
     CPP := $(CC1) -E
   else ifeq ($(PLATFORM), ps2)
@@ -355,6 +379,8 @@ else ifeq ($(PLATFORM),sdl)
     else
         MAP_FLAG := -Xlinker -Map=
     endif
+else ifeq ($(PLATFORM),sdl_ios)
+    MAP_FLAG := -Wl,-map,
 # Win32, PSP, PS2
 else
     MAP_FLAG := -Xlinker -Map=
@@ -365,6 +391,8 @@ ifeq ($(PLATFORM),gba)
     LIBS := $(ROOT_DIR)/tools/agbcc/lib/libgcc.a $(ROOT_DIR)/tools/agbcc/lib/libc.a $(LIBABGSYSCALL_LIBS)
 else ifeq ($(PLATFORM),sdl)
     LIBS := $(shell sdl2-config --cflags --libs) $(LIBABGSYSCALL_LIBS) -lm
+else ifeq ($(PLATFORM),sdl_ios)
+    LIBS := -L$(SDL2_IOS_ROOT)/lib $(LIBABGSYSCALL_LIBS) -lSDL2 -lm -liconv -Wl,-ObjC -framework AudioToolbox -framework AVFoundation -framework CoreAudio -framework CoreGraphics -framework CoreHaptics -framework CoreMotion -framework Foundation -framework GameController -framework Metal -framework OpenGLES -framework QuartzCore -framework UIKit
 else ifeq ($(PLATFORM),sdl_psp)
     LIBS := -L$(PSPDEV)/psp/lib $(LIBABGSYSCALL_LIBS) -L$(PSPSDK)/lib -lSDL2 -lm -lGL -lpspvram -lpspaudio -lpspvfpu -lpspdisplay -lpspgu -lpspge -lpsphprm -lpspctrl -lpsppower -lpspdebug -lpspnet -lpspnet_apctl -Wl,-zmax-page-size=128
 else ifeq ($(PLATFORM),ps2)
@@ -476,6 +504,8 @@ europe: ; @$(MAKE) GAME_REGION=EUROPE
 
 sdl: ; @$(MAKE) PLATFORM=sdl
 
+sdl_ios: ; @$(MAKE) PLATFORM=sdl_ios CPU_ARCH=arm
+
 sdl_psp: ; @$(MAKE) PLATFORM=sdl_psp
 
 ps2: ; @$(MAKE) PLATFORM=ps2
@@ -549,6 +579,8 @@ ifeq ($(PLATFORM),gba)
 else ifeq ($(PLATFORM),win32)
 	$(OBJCOPY) -O pei-x86-64 $< $@
 else ifeq ($(PLATFORM),sdl)
+	cp $< $@
+else ifeq ($(PLATFORM),sdl_ios)
 	cp $< $@
 else ifeq ($(PLATFORM),sdl_psp)
 	@echo Creating $(ROM) from $(ELF)

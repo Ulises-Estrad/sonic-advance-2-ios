@@ -1,0 +1,191 @@
+name: iOS Device IPA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/ios-device.yml"
+      - "Makefile"
+      - "config.mk"
+      - "ios/**"
+      - "include/**"
+      - "libagbsyscall/**"
+      - "src/**"
+      - "data/**"
+      - "graphics/**"
+      - "sound/**"
+      - "tools/**"
+      - "*.mk"
+
+concurrency:
+  group: sonic-advance-2-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios-device-ipa:
+    name: Build Sonic Advance 2 iOS IPA for device arm64
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    env:
+      SDL2_VERSION: "2.30.12"
+      IOS_DEVICE_ARCH: "arm64"
+      IOS_MIN_VERSION: "13.0"
+      ARTIFACT_DIR: "ci-artifacts/sonic-advance-2-ios"
+      IPA_NAME: "SonicAdvance2-ios-device-adhoc.ipa"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Print tool versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_DIR/logs"
+          {
+            echo "## sw_vers"
+            sw_vers
+            echo
+            echo "## uname -a"
+            uname -a
+            echo
+            echo "## xcodebuild -version"
+            xcodebuild -version
+            echo
+            echo "## iphoneos SDK"
+            xcrun --sdk iphoneos --show-sdk-path
+            echo
+            echo "## make"
+            make --version | head -n 1
+            echo
+            echo "## clang"
+            xcrun --sdk iphoneos clang --version
+            echo
+            echo "## cmake"
+            cmake --version
+          } 2>&1 | tee "$ARTIFACT_DIR/logs/tool-versions.log"
+
+      - name: Install host build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            brew list libpng >/dev/null 2>&1 || brew install libpng
+          } 2>&1 | tee "$ARTIFACT_DIR/logs/host-deps.log"
+
+      - name: Fetch SDL2 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sdl2-src"
+          SDL2_TARBALL="$RUNNER_TEMP/SDL2-${SDL2_VERSION}.tar.gz"
+          {
+            curl -L --fail --retry 3 \
+              "https://www.libsdl.org/release/SDL2-${SDL2_VERSION}.tar.gz" \
+              -o "$SDL2_TARBALL"
+            tar -xzf "$SDL2_TARBALL" -C "$RUNNER_TEMP/sdl2-src" --strip-components=1
+          } 2>&1 | tee "$ARTIFACT_DIR/logs/sdl2-fetch.log"
+
+      - name: Configure SDL2 for iOS device
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDL2_PREFIX="$GITHUB_WORKSPACE/_deps/sdl2-ios-device"
+          {
+            echo "SDL2_IOS_DEVICE_PREFIX=$SDL2_PREFIX" >> "$GITHUB_ENV"
+            cmake -S "$RUNNER_TEMP/sdl2-src" \
+              -B "$RUNNER_TEMP/sdl2-build-device" \
+              -G Xcode \
+              -DCMAKE_SYSTEM_NAME=iOS \
+              -DCMAKE_OSX_SYSROOT=iphoneos \
+              -DCMAKE_OSX_ARCHITECTURES="$IOS_DEVICE_ARCH" \
+              -DCMAKE_INSTALL_PREFIX="$SDL2_PREFIX" \
+              -DSDL_STATIC=ON \
+              -DSDL_SHARED=OFF \
+              -DSDL_TEST=OFF
+          } 2>&1 | tee "$ARTIFACT_DIR/logs/sdl2-configure.log"
+
+      - name: Build and install SDL2 for iOS device
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            cmake --build "$RUNNER_TEMP/sdl2-build-device" \
+              --config Release \
+              -- \
+              -destination 'generic/platform=iOS' \
+              CODE_SIGNING_ALLOWED=NO
+            cmake --install "$RUNNER_TEMP/sdl2-build-device" --config Release
+            find "$SDL2_IOS_DEVICE_PREFIX" -maxdepth 5 -print | sort
+          } 2>&1 | tee "$ARTIFACT_DIR/logs/sdl2-build-install.log"
+
+      - name: Build Sonic Advance 2 iOS binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            make -j"$(sysctl -n hw.logicalcpu)" \
+              sdl_ios \
+              SDL2_IOS_ROOT="$SDL2_IOS_DEVICE_PREFIX" \
+              IOS_SDK=iphoneos \
+              IOS_ARCH="$IOS_DEVICE_ARCH" \
+              IOS_MIN_VERSION="$IOS_MIN_VERSION"
+            test -x sa2.sdl_ios
+            file sa2.sdl_ios
+            lipo -info sa2.sdl_ios
+          } 2>&1 | tee "$ARTIFACT_DIR/logs/sa2-ios-build.log"
+
+      - name: Package ad-hoc signed IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            IPA_STAGE="$RUNNER_TEMP/sa2-ios-ipa"
+            IPA_INSPECT="$RUNNER_TEMP/sa2-ios-ipa-inspect"
+            APP_PATH="$IPA_STAGE/Payload/SonicAdvance2.app"
+            rm -rf "$IPA_STAGE" "$IPA_INSPECT"
+            mkdir -p "$APP_PATH" "$ARTIFACT_DIR/build-products"
+
+            cp ios/Info.plist "$APP_PATH/Info.plist"
+            cp sa2.sdl_ios "$APP_PATH/SonicAdvance2"
+            chmod +x "$APP_PATH/SonicAdvance2"
+            printf 'APPL????' > "$APP_PATH/PkgInfo"
+
+            echo "App bundle tree before signing:"
+            find "$APP_PATH" -maxdepth 3 -print | sort
+            echo "Info.plist:"
+            plutil -p "$APP_PATH/Info.plist"
+            echo "Executable:"
+            file "$APP_PATH/SonicAdvance2"
+            lipo -info "$APP_PATH/SonicAdvance2"
+
+            codesign --force --sign - --timestamp=none "$APP_PATH"
+            codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+            codesign --display --verbose=4 "$APP_PATH" 2>&1 || true
+
+            (cd "$IPA_STAGE" && zip -qry "$GITHUB_WORKSPACE/$ARTIFACT_DIR/build-products/$IPA_NAME" Payload)
+            unzip -l "$ARTIFACT_DIR/build-products/$IPA_NAME" | tee "$ARTIFACT_DIR/logs/ipa-contents.log"
+            unzip -q "$ARTIFACT_DIR/build-products/$IPA_NAME" -d "$IPA_INSPECT"
+
+            test -d "$IPA_INSPECT/Payload/SonicAdvance2.app"
+            test -x "$IPA_INSPECT/Payload/SonicAdvance2.app/SonicAdvance2"
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$IPA_INSPECT/Payload/SonicAdvance2.app/Info.plist" | grep -Fx 'SonicAdvance2'
+            /usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$IPA_INSPECT/Payload/SonicAdvance2.app/Info.plist" | grep -Fx 'APPL'
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$IPA_INSPECT/Payload/SonicAdvance2.app/Info.plist" | grep -E '^[A-Za-z0-9.-]+$'
+            /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$IPA_INSPECT/Payload/SonicAdvance2.app/Info.plist"
+            /usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily:0' "$IPA_INSPECT/Payload/SonicAdvance2.app/Info.plist" | grep -Fx '1'
+            /usr/libexec/PlistBuddy -c 'Print :UIFileSharingEnabled' "$IPA_INSPECT/Payload/SonicAdvance2.app/Info.plist" | grep -Fx 'true'
+            /usr/libexec/PlistBuddy -c 'Print :LSSupportsOpeningDocumentsInPlace' "$IPA_INSPECT/Payload/SonicAdvance2.app/Info.plist" | grep -Fx 'true'
+            lipo -info "$IPA_INSPECT/Payload/SonicAdvance2.app/SonicAdvance2" | grep -F "$IOS_DEVICE_ARCH"
+            codesign --verify --deep --strict --verbose=2 "$IPA_INSPECT/Payload/SonicAdvance2.app"
+          } 2>&1 | tee "$ARTIFACT_DIR/logs/package-ipa.log"
+
+      - name: Upload iOS IPA and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonic-advance-2-ios-device-arm64
+          path: ci-artifacts/sonic-advance-2-ios
+          if-no-files-found: warn
+          retention-days: 14

@@ -48,7 +48,9 @@ else ifeq ($(PLATFORM),sdl_psp)
 else ifeq ($(PLATFORM),ps2)
   PREFIX := mips64r5900el-ps2-elf-
 else ifneq ($(PLATFORM),sdl)
-   $(error Unknown CPU architecture $(CPU_ARCH))
+  ifneq ($(PLATFORM),sdl_ios)
+    $(error Unknown CPU architecture $(CPU_ARCH))
+  endif
 endif # (PLATFORM == gba)
 
 ifeq ($(OS),Windows_NT)
@@ -103,6 +105,17 @@ ifneq ($(PLATFORM),gba)
     endif
     endif
 endif # PLATFORM != gba
+
+ifeq ($(PLATFORM),sdl_ios)
+IOS_SDK         ?= iphoneos
+IOS_ARCH        ?= arm64
+IOS_MIN_VERSION ?= 13.0
+IOS_SYSROOT     ?= $(shell xcrun --sdk $(IOS_SDK) --show-sdk-path)
+CC1             := xcrun --sdk $(IOS_SDK) clang -arch $(IOS_ARCH) -isysroot $(IOS_SYSROOT) -miphoneos-version-min=$(IOS_MIN_VERSION)
+CPP             := $(CC1) -E
+AS              := $(CC1) -x assembler -c
+AR              := xcrun --sdk $(IOS_SDK) ar
+endif
 
 
 ifeq ($(CPU_ARCH),arm)

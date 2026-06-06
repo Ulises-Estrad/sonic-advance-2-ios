@@ -16,6 +16,8 @@
 
 > :warning: **This project is not completed and still under active development**
 
+> **iOS port fork:** this fork is being adapted into a physical-device iPhone port using the existing SDL build as the base. See [IOS_PORT.md](IOS_PORT.md) for the Sideloadly IPA workflow, iOS controls, diagnostics, and current test checklist.
+
 This is a work in progress matching decompilation of Sonic Advance 1, 2, [& eventually 3](https://github.com/SAT-R/sa3/)
 
 It builds the following ROMs:
